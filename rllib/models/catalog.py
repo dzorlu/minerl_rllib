@@ -232,7 +232,7 @@ class ModelCatalog:
                     all_discrete = False
                     size += np.product(flat_action_space[i].shape)
             size = int(size)
-            return (tf.int64 if all_discrete else tf.float32, (None, size))
+            return (np.int64 if all_discrete else np.float32, (None, size))
         else:
             raise NotImplementedError(
                 "Action space {} not supported".format(action_space))
