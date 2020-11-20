@@ -54,13 +54,42 @@ logger = logging.getLogger(__name__)
 
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--run", type=str, default="PPO")
-parser.add_argument("--stop-iters", type=int, default=50)
-parser.add_argument("--stop-timesteps", type=int, default=100000)
+parser.add_argument("--stop-iters", type=int, default=1000000)
+parser.add_argument("--stop-timesteps", type=int, default=1000000)
 parser.add_argument("--stop-reward", type=float, default=0.1)
 
-NB_SUBTASKS = 11
+NB_SUBTASKS = 5
 NUM_ACTIONS = 30
+ENV_NAME = "MineRLObtainDiamondVectorObf-v0"
+MINERL_DATA_ROOT = '/data'
+
+def create_clusters(num_actions=NUM_ACTIONS):
+    k_means = KMeans(n_clusters=num_actions, random_state=0)
+    print('create kmeans mapping')
+    model_path='/home/deniz/ray_results/kmeans/'
+    file_path = os.path.join(model_path, 'k_means.pkl')
+
+    # replay trajectories
+    data = minerl.data.make(ENV_NAME, 
+                            data_dir=MINERL_DATA_ROOT, 
+                            num_workers=1,
+                            worker_batch_size=4)
+    trajectories = data.get_trajectory_names()[:25]
+    actions = list()
+    for t, trajectory in enumerate(trajectories):
+        logger.info({str(t): trajectory})
+        for i, (state, a, r, _, done, meta) in enumerate(data.load_data(trajectory, include_metadata=True)):    
+            action = a['vector'].reshape(1, 64)
+            actions.append(action)
+    actions = np.vstack(actions)
+    k_means.fit(actions)
+    logger.info({'finished': len(actions)})
+    del actions
+    pickle.dump(k_means, open(file_path, 'wb'))
+    logger.info({'persisted k-means under': file_path})
+    print('persisted k-means')
+    return k_means
+
 
 
 class MineRLEnv(gym.Wrapper, MultiAgentEnv):
@@ -74,16 +103,21 @@ class MineRLEnv(gym.Wrapper, MultiAgentEnv):
     in each phase, there is a set of subtasks that are active.
 
     """
-    def __init__(self, env):
+    def __init__(self, env, config):
+        print("env")
+        print(env)
+        print("config")
+        print(config)
         gym.Wrapper.__init__(self, env)
         # curriculum learning ix
         # couple w/ env_rewards, ix determines the `task`
         self.phase = 0
         self.env_times_reward = Counter()
 
-        num_actions = NUM_ACTIONS
+        num_actions = config.get('num_actions')
+        num_subtasks = config.get('num_subtasks')
 
-        env_rewards = {i: {'reward': 2**i, 'times': 1} for i in range(NB_SUBTASKS)}
+        env_rewards = {i: {'reward': 2**i, 'times': 1} for i in range(num_subtasks)}
         env_rewards[0]['times'] = 64 # #1 needs 64 logs to complete.
         self.env_expected_rewards = env_rewards
 
@@ -102,31 +136,11 @@ class MineRLEnv(gym.Wrapper, MultiAgentEnv):
         # build demonstation dataset at initialization
         self.build_replay_data()
         # discrete control
-        # self.k_means = self.train_mapping(num_actions, model_path)
+        self.k_means = config.get('kmeans')
+        print("k-means completed.")
     
     def build_replay_data(self):
         pass
-
-    @classmethod
-    def train_mapping(num_actions, model_path):
-        k_means = KMeans(n_clusters=num_actions, random_state=0)
-        file_path = os.path.join(model_path, 'k_means.pkl')
-
-        # replay trajectories
-        trajectories = dat_loader.get_trajectory_names()[:5]
-        actions = list()
-        for t, trajectory in enumerate(trajectories):
-            logger.info({str(t): trajectory})
-            for i, (state, a, r, _, done, meta) in enumerate(dat_loader.load_data(trajectory, include_metadata=True)):    
-                action = a['vector'].reshape(1, 64)
-                actions.append(action)
-        actions = np.vstack(actions)
-        k_means.fit(actions)
-        logger.info({'finished': len(actions)})
-        del actions
-        pickle.dump(k_means, open(file_path, 'wb'))
-        logger.info({'persisted k-means under': file_path})
-        return k_means
     
     def increment_phase(self):
         """
@@ -181,8 +195,8 @@ class MineRLEnv(gym.Wrapper, MultiAgentEnv):
 
     def convert_action(self, action: np.array) -> OrderedDict:
         # map to cont action space that env demands
-        #return OrderedDict({'vector': self.k_means.cluster_centers_[action]})
-        return self.env.action_space.sample()
+        return OrderedDict({'vector': self.k_means.cluster_centers_[action]})
+        #return self.env.action_space.sample()
 
     def step(
             self, action_dict: Dict[AgentID, int]
@@ -309,7 +323,7 @@ class TaskModel(TorchRNN, nn.Module):
         self.obs_shape = observation_size_in
         self.input_size = input_size
 
-        # share the vision model.
+        # share the vision model and the value branch.
         self.vision_encoder = VISION_MODEL
         self.value_branch = VALUE_BRANCH
 
@@ -395,12 +409,12 @@ if __name__ == "__main__":
     ray.init()
 
     # register environment
-    ENV_NAME = "MineRLObtainDiamondVectorObf-v0"
-    def fn():
+    
+    def _wrap():
         import minerl
         return gym.make(ENV_NAME)
     register_env("minecraft", 
-        lambda _: MineRLEnv(env=fn()))
+        lambda config: MineRLEnv(env=_wrap(),config=config))
     # register model
     logger.info("registering the model")
     ModelCatalog.register_custom_model(
@@ -423,7 +437,9 @@ if __name__ == "__main__":
     config = {
         "env": 'minecraft',
         "env_config": {
-            "num_actions": NUM_ACTIONS #number of discrete actions
+            "num_actions": NUM_ACTIONS, #number of discrete actions
+            "kmeans": create_clusters(),
+            "num_subtasks": NB_SUBTASKS,
         },
         # "callbacks": {
         #     "on_train_result": on_train_result,
@@ -442,7 +458,11 @@ if __name__ == "__main__":
             "policy_mapping_fn": (lambda x: f"policy_{x}"),
         },
         "num_workers": 1,  # parallelism. number of rollout actors.
+        "num_envs_per_worker":2,
+        "num_cpus_per_worker": 5,
         "framework": "torch",
+        "train_batch_size": 400,
+        "rollout_fragment_length": 50,
     }
 
     stop = {
@@ -452,6 +472,7 @@ if __name__ == "__main__":
     }
     logger.info("start tuning..")
     results = tune.run("IMPALA", 
+                       checkpoint_freq=20, #number of iterations. 1 iter = .train() call
                        config=config, 
                        stop=stop,
                        verbose=1)
