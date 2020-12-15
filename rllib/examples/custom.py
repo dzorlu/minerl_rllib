@@ -54,16 +54,18 @@ logger = logging.getLogger(__name__)
 
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--stop-iters", type=int, default=1000000)
-parser.add_argument("--stop-timesteps", type=int, default=1000000)
+parser.add_argument("--stop-iters", type=int, default=None)
+parser.add_argument("--stop-timesteps", type=int, default=5000000)
 parser.add_argument("--stop-reward", type=float, default=0.1)
 
 NB_SUBTASKS = 5
 NUM_ACTIONS = 30
 ENV_NAME = "MineRLObtainDiamondVectorObf-v0"
 MINERL_DATA_ROOT = '/data'
+# speeds up the env
+os.environ["OMP_NUM_THREADS"] = "1"
 
-def create_clusters(num_actions=NUM_ACTIONS):
+def create_clusters(num_actions=NUM_ACTIONS, num_trajectories=5):
     k_means = KMeans(n_clusters=num_actions, random_state=0)
     print('create kmeans mapping')
     model_path='/home/deniz/ray_results/kmeans/'
@@ -74,7 +76,7 @@ def create_clusters(num_actions=NUM_ACTIONS):
                             data_dir=MINERL_DATA_ROOT, 
                             num_workers=1,
                             worker_batch_size=4)
-    trajectories = data.get_trajectory_names()[:25]
+    trajectories = data.get_trajectory_names()[:num_trajectories]
     actions = list()
     for t, trajectory in enumerate(trajectories):
         logger.info({str(t): trajectory})
@@ -86,7 +88,7 @@ def create_clusters(num_actions=NUM_ACTIONS):
     logger.info({'finished': len(actions)})
     del actions
     pickle.dump(k_means, open(file_path, 'wb'))
-    logger.info({'persisted k-means under': file_path})
+    #logger.info({'persisted k-means under': file_path})
     print('persisted k-means')
     return k_means
 
@@ -458,21 +460,21 @@ if __name__ == "__main__":
             "policy_mapping_fn": (lambda x: f"policy_{x}"),
         },
         "num_workers": 1,  # parallelism. number of rollout actors.
-        "num_envs_per_worker":2,
+        "num_envs_per_worker": 1,
         "num_cpus_per_worker": 5,
         "framework": "torch",
-        "train_batch_size": 400,
+        "train_batch_size": 600,
         "rollout_fragment_length": 50,
     }
 
     stop = {
-        "training_iteration": args.stop_iters,
         "timesteps_total": args.stop_timesteps,
         "episode_reward_mean": args.stop_reward,
     }
     logger.info("start tuning..")
     results = tune.run("IMPALA", 
                        checkpoint_freq=20, #number of iterations. 1 iter = .train() call
+                       keep_checkpoints_num=10,
                        config=config, 
                        stop=stop,
                        verbose=1)
